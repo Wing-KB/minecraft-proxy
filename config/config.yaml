@@ -1,0 +1,15 @@
+# NAT 穿透设置
+nat:
+  enabled: true
+  stun_servers:
+    - "stun.l.google.com:19302"
+  timeout: 30
+  retry_count: 3
+  keepalive_interval: 25
+
+# 语音聊天设置
+voice:
+  enabled: true
+  codec: "opus"
+  sample_rate: 48000
+  udp_port: 24454
