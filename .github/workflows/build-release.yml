@@ -1,0 +1,108 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (如 1.2.0)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            artifact_name: MinecraftProxy-Windows
+            extension: .exe
+          - os: macos-latest
+            name: macOS
+            artifact_name: MinecraftProxy-macOS
+            extension: ''
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller pyyaml PyQt5
+
+      - name: Build on Windows
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          pyinstaller --onedir --noconfirm --clean --name MinecraftProxy --icon=assets/icon.ico launcher.py 2>&1 || pyinstaller --onedir --noconfirm --clean --name MinecraftProxy launcher.py 2>&1
+
+      - name: Build on macOS
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          pyinstaller --onedir --noconfirm --clean --name MinecraftProxy launcher.py 2>&1
+
+      - name: Package
+        shell: bash
+        run: |
+          cd dist
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            powershell -Command "Compress-Archive -Path MinecraftProxy/* -DestinationPath MinecraftProxy-Windows.zip -Force"
+            mv MinecraftProxy-Windows.zip ..
+          else
+            tar -czvf ../MinecraftProxy-macOS.tar.gz MinecraftProxy
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.os == 'windows-latest' && 'MinecraftProxy-Windows.zip' || 'MinecraftProxy-macOS.tar.gz' }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          if [ -z "$VERSION" ]; then
+            VERSION=${{ github.event.inputs.version || '1.0.0' }}
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Created version: $VERSION"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          name: MinecraftProxy v${{ steps.version.outputs.VERSION }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/MinecraftProxy-Windows/MinecraftProxy-Windows.zip
+            dist/MinecraftProxy-macOS/MinecraftProxy-macOS.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
