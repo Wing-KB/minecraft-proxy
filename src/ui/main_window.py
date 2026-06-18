@@ -1,6 +1,7 @@
 """
-PyQt5 主窗口 —— 真正接入联机逻辑
+PyQt5 主窗口 —— 支持陶瓦联机兼容
 """
+
 import sys
 import asyncio
 import threading
@@ -10,29 +11,29 @@ from typing import Optional
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QTabWidget, QGroupBox,
-    QFormLayout, QSpinBox, QCheckBox, QListWidget, QListWidgetItem,
-    QStatusBar, QTextEdit, QMessageBox, QDialog, QDialogButtonBox
+    QFormLayout, QSpinBox, QCheckBox, QStatusBar, QTextEdit,
+    QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtGui import QFont
 
 logger = logging.getLogger(__name__)
 
 
 # ── 异步桥 ────────────────────────────────────────────────────
+
 class AsyncBridge(QObject):
-    """在后台线程运行 asyncio 事件循环，通过信号与 Qt 通信"""
-    status_signal = pyqtSignal(str)    # 状态文字
-    code_signal   = pyqtSignal(str)    # 房间码（房主用）
-    count_signal  = pyqtSignal(int)    # 玩家数（房主用）
-    error_signal  = pyqtSignal(str)    # 错误
-    ready_signal  = pyqtSignal()       # 连接就绪（玩家用）
-    stopped_signal = pyqtSignal()      # 会话结束
+    status_signal  = pyqtSignal(str)
+    code_signal    = pyqtSignal(str)
+    count_signal   = pyqtSignal(int)
+    error_signal   = pyqtSignal(str)
+    ready_signal   = pyqtSignal()
+    stopped_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
+        self._loop = None
+        self._thread = None
         self._server = None
         self._client = None
 
@@ -45,18 +46,25 @@ class AsyncBridge(QObject):
             self._thread.start()
 
     def start_host(self, relay_host: str, relay_port: int,
-                   mc_host: str, mc_port: int):
+                     mc_host: str, mc_port: int,
+                     use_terracotta: bool = False,
+                     want_udp: bool = True,
+                     requested_code: str = ""):
         self._ensure_loop()
         asyncio.run_coroutine_threadsafe(
-            self._run_host(relay_host, relay_port, mc_host, mc_port),
+            self._run_host(relay_host, relay_port, mc_host, mc_port,
+                           use_terracotta, want_udp, requested_code),
             self._loop
         )
 
     def start_player(self, relay_host: str, relay_port: int,
-                     room_code: str, local_port: int):
+                      room_code: str, local_port: int,
+                      use_terracotta: bool = False,
+                      want_udp: bool = True):
         self._ensure_loop()
         asyncio.run_coroutine_threadsafe(
-            self._run_player(relay_host, relay_port, room_code, local_port),
+            self._run_player(relay_host, relay_port, room_code,
+                             local_port, use_terracotta, want_udp),
             self._loop
         )
 
@@ -64,18 +72,22 @@ class AsyncBridge(QObject):
         if self._loop:
             asyncio.run_coroutine_threadsafe(self._stop(), self._loop)
 
-    async def _run_host(self, relay_host, relay_port, mc_host, mc_port):
-        from ..core.server import ProxyServer
-        self._server = ProxyServer(
+    async def _run_host(self, relay_host, relay_port, mc_host, mc_port,
+                          use_terracotta, want_udp, requested_code):
+        from ..core.host_session import HostSession
+        self._server = HostSession(
             relay_host=relay_host,
             relay_port=relay_port,
             mc_host=mc_host,
             mc_port=mc_port,
-            on_status=lambda msg: self.status_signal.emit(msg),
+            use_terracotta=use_terracotta,
+            enable_udp=want_udp,
+            on_status=lambda m: self.status_signal.emit(m),
             on_player_count=lambda n: self.count_signal.emit(n),
+            on_room_code=lambda c: self.code_signal.emit(c),
         )
         try:
-            code = await self._server.start()
+            code = await self._server.start(requested_code)
             self.code_signal.emit(code)
             await self._server.wait_until_stopped()
         except Exception as e:
@@ -84,21 +96,24 @@ class AsyncBridge(QObject):
             self.stopped_signal.emit()
             self._server = None
 
-    async def _run_player(self, relay_host, relay_port, room_code, local_port):
-        from ..core.client import ProxyClient
-        self._client = ProxyClient(
+    async def _run_player(self, relay_host, relay_port, room_code,
+                             local_port, use_terracotta, want_udp):
+        from ..core.player_session import PlayerSession
+        self._client = PlayerSession(
             relay_host=relay_host,
             relay_port=relay_port,
+            room_code=room_code,
+            local_host="127.0.0.1",
             local_port=local_port,
-            on_status=lambda msg: self.status_signal.emit(msg),
+            use_terracotta=use_terracotta,
+            enable_udp=want_udp,
+            on_status=lambda m: self.status_signal.emit(m),
         )
         try:
-            ok = await self._client.connect(room_code)
-            if ok:
-                self.ready_signal.emit()
-                await self._client.wait_until_stopped()
-            else:
-                self.error_signal.emit("加入房间失败，请检查中继服务器地址和房间码")
+            await self._client.connect()
+            self.ready_signal.emit()
+            await self._client.start_local()
+            await self._client.wait_until_stopped()
         except Exception as e:
             self.error_signal.emit(str(e))
         finally:
@@ -109,16 +124,17 @@ class AsyncBridge(QObject):
         if self._server:
             await self._server.stop()
         if self._client:
-            await self._client.disconnect()
+            await self._client.stop()
 
 
 # ── 主窗口 ────────────────────────────────────────────────────
+
 class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Minecraft 异地联机工具 v2.0")
-        self.setMinimumSize(860, 620)
+        self.setWindowTitle("Minecraft 异地联机工具")
+        self.setMinimumSize(900, 660)
 
         self._bridge = AsyncBridge()
         self._bridge.status_signal.connect(self._on_status)
@@ -128,7 +144,7 @@ class MainWindow(QMainWindow):
         self._bridge.ready_signal.connect(self._on_player_ready)
         self._bridge.stopped_signal.connect(self._on_session_stopped)
 
-        self._mode = "idle"   # idle / host / player
+        self._mode = "idle"
         self._room_code = ""
         self._player_count = 0
 
@@ -159,52 +175,65 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        # 服务器设置
-        group = QGroupBox("本地 Minecraft 服务器")
-        form = QFormLayout()
-
+        # MC 服务器设置
+        g1 = QGroupBox("本地 Minecraft 服务器")
+        f1 = QFormLayout()
         self.host_mc_host = QLineEdit("127.0.0.1")
-        form.addRow("MC 服务器地址:", self.host_mc_host)
-
+        f1.addRow("MC 地址:", self.host_mc_host)
         self.host_mc_port = QSpinBox()
         self.host_mc_port.setRange(1024, 65535)
         self.host_mc_port.setValue(25565)
-        form.addRow("MC 端口:", self.host_mc_port)
-
-        group.setLayout(form)
-        layout.addWidget(group)
+        f1.addRow("MC 端口:", self.host_mc_port)
+        g1.setLayout(f1)
+        layout.addWidget(g1)
 
         # 中继配置
-        relay_group = QGroupBox("中继服务器")
-        relay_form = QFormLayout()
-
+        g2 = QGroupBox("中继服务器")
+        f2 = QFormLayout()
         self.host_relay = QLineEdit()
-        self.host_relay.setPlaceholderText("中继服务器 IP（如 1.2.3.4）")
-        relay_form.addRow("中继地址:", self.host_relay)
-
+        self.host_relay.setPlaceholderText("中继服务器 IP 或域名")
+        f2.addRow("中继地址:", self.host_relay)
         self.host_relay_port = QSpinBox()
         self.host_relay_port.setRange(1024, 65535)
         self.host_relay_port.setValue(25566)
-        relay_form.addRow("中继端口:", self.host_relay_port)
+        f2.addRow("中继端口:", self.host_relay_port)
+        g2.setLayout(f2)
+        layout.addWidget(g2)
 
-        relay_group.setLayout(relay_form)
-        layout.addWidget(relay_group)
+        # 陶瓦 / UDP 选项
+        g_opt = QGroupBox("联机选项")
+        opt_layout = QHBoxLayout()
+        self.host_terracotta = QCheckBox("使用陶瓦联机")
+        self.host_terracotta.setToolTip("勾选后房间内禁用 UDP 中继（陶瓦基于 P2P VPN）")
+        opt_layout.addWidget(self.host_terracotta)
+        self.host_want_udp = QCheckBox("启用 UDP 中继")
+        self.host_want_udp.setChecked(True)
+        self.host_want_udp.setToolTip("无人用陶瓦时，在中继上开启 UDP 端口映射")
+        opt_layout.addWidget(self.host_want_udp)
+        opt_layout.addStretch()
+        g_opt.setLayout(opt_layout)
+        layout.addWidget(g_opt)
+
+        # 指定房间码（可选）
+        self.host_req_code = QLineEdit()
+        self.host_req_code.setPlaceholderText("可选：指定房间码（6位 或 陶瓦格式 U/XXXX-...）")
+        self.host_req_code.setMaxLength(21)
+        layout.addWidget(QLabel("指定房间码（可选）:"))
+        layout.addWidget(self.host_req_code)
 
         # 房间码显示
-        room_group = QGroupBox("房间码（创建后分享给好友）")
+        g3 = QGroupBox("房间码（创建后分享给好友）")
         room_layout = QVBoxLayout()
-
         self.room_code_label = QLabel("——")
         self.room_code_label.setFont(QFont("Consolas", 28, QFont.Bold))
         self.room_code_label.setAlignment(Qt.AlignCenter)
         self.room_code_label.setStyleSheet(
             "color: #1976D2; background: #E3F2FD; padding: 18px; "
-            "border-radius: 8px; letter-spacing: 8px;"
+            "border-radius: 8px; letter-spacing: 6px;"
         )
         room_layout.addWidget(self.room_code_label)
 
         btn_row = QHBoxLayout()
-
         self.btn_copy_code = QPushButton("📋 复制房间码")
         self.btn_copy_code.setEnabled(False)
         self.btn_copy_code.clicked.connect(self._copy_code)
@@ -224,17 +253,17 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_stop_host)
 
         room_layout.addLayout(btn_row)
-        room_group.setLayout(room_layout)
-        layout.addWidget(room_group)
+        g3.setLayout(room_layout)
+        layout.addWidget(g3)
 
-        # 已连接玩家
-        player_group = QGroupBox("已连接玩家")
+        # 玩家列表
+        g4 = QGroupBox("已连接玩家")
         player_layout = QVBoxLayout()
         self.player_count_label = QLabel("等待玩家加入...")
         self.player_count_label.setFont(QFont("Microsoft YaHei", 11))
         player_layout.addWidget(self.player_count_label)
-        player_group.setLayout(player_layout)
-        layout.addWidget(player_group)
+        g4.setLayout(player_layout)
+        layout.addWidget(g4)
 
         layout.addStretch()
         self.tabs.addTab(tab, "🏠 房主模式")
@@ -243,32 +272,44 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        group = QGroupBox("加入联机房间")
-        form = QFormLayout()
+        g1 = QGroupBox("加入联机房间")
+        f1 = QFormLayout()
 
         self.join_code = QLineEdit()
-        self.join_code.setPlaceholderText("输入 6 位房间码（如 AB3C2D）")
-        self.join_code.setMaxLength(6)
-        self.join_code.setFont(QFont("Consolas", 18))
+        self.join_code.setPlaceholderText("输入房间码（6位 或 陶瓦格式 U/XXXX-...）")
+        self.join_code.setMaxLength(21)
+        self.join_code.setFont(QFont("Consolas", 16))
         self.join_code.setAlignment(Qt.AlignCenter)
-        form.addRow("房间码:", self.join_code)
+        f1.addRow("房间码:", self.join_code)
 
         self.join_relay = QLineEdit()
-        self.join_relay.setPlaceholderText("中继服务器 IP")
-        form.addRow("中继地址:", self.join_relay)
+        self.join_relay.setPlaceholderText("中继服务器 IP 或域名")
+        f1.addRow("中继地址:", self.join_relay)
 
         self.join_relay_port = QSpinBox()
         self.join_relay_port.setRange(1024, 65535)
         self.join_relay_port.setValue(25566)
-        form.addRow("中继端口:", self.join_relay_port)
+        f1.addRow("中继端口:", self.join_relay_port)
 
         self.join_local_port = QSpinBox()
         self.join_local_port.setRange(1024, 65535)
         self.join_local_port.setValue(25565)
-        form.addRow("本地监听端口:", self.join_local_port)
+        f1.addRow("本地监听端口:", self.join_local_port)
 
-        group.setLayout(form)
-        layout.addWidget(group)
+        g1.setLayout(f1)
+        layout.addWidget(g1)
+
+        # 选项
+        g_opt = QGroupBox("联机选项")
+        opt_layout = QHBoxLayout()
+        self.join_terracotta = QCheckBox("使用陶瓦联机")
+        opt_layout.addWidget(self.join_terracotta)
+        self.join_want_udp = QCheckBox("启用 UDP 中继")
+        self.join_want_udp.setChecked(True)
+        opt_layout.addWidget(self.join_want_udp)
+        opt_layout.addStretch()
+        g_opt.setLayout(opt_layout)
+        layout.addWidget(g_opt)
 
         self.join_status_label = QLabel("")
         self.join_status_label.setAlignment(Qt.AlignCenter)
@@ -288,7 +329,6 @@ class MainWindow(QMainWindow):
         self.btn_stop_player.setStyleSheet("background: #f44336; color: white; padding: 12px;")
         self.btn_stop_player.clicked.connect(self._stop_session)
         btn_row.addWidget(self.btn_stop_player)
-
         layout.addLayout(btn_row)
 
         tip = QLabel(
@@ -303,23 +343,19 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, "🔗 加入游戏")
 
     def _create_relay_tab(self):
-        """内置中继服务器选项卡（用于自己开服的人）"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        group = QGroupBox("内置中继服务器（需要公网 IP 的机器运行）")
-        form = QFormLayout()
-
+        g1 = QGroupBox("内置中继服务器（需运行在有公网 IP 的机器上）")
+        f1 = QFormLayout()
         self.relay_bind = QLineEdit("0.0.0.0")
-        form.addRow("监听地址:", self.relay_bind)
-
+        f1.addRow("监听地址:", self.relay_bind)
         self.relay_port_spin = QSpinBox()
         self.relay_port_spin.setRange(1024, 65535)
         self.relay_port_spin.setValue(25566)
-        form.addRow("监听端口:", self.relay_port_spin)
-
-        group.setLayout(form)
-        layout.addWidget(group)
+        f1.addRow("TCP 端口:", self.relay_port_spin)
+        g1.setLayout(f1)
+        layout.addWidget(g1)
 
         btn_row = QHBoxLayout()
         self.btn_start_relay = QPushButton("▶ 启动中继服务器")
@@ -331,7 +367,6 @@ class MainWindow(QMainWindow):
         self.btn_stop_relay.setEnabled(False)
         self.btn_stop_relay.clicked.connect(self._stop_relay)
         btn_row.addWidget(self.btn_stop_relay)
-
         layout.addLayout(btn_row)
 
         self.relay_status_label = QLabel("中继服务器未运行")
@@ -340,7 +375,7 @@ class MainWindow(QMainWindow):
 
         tip = QLabel(
             "💡 如果你有公网 IP，可以在这里启动中继服务器让好友连接。\n"
-            "   否则需要借用第三方中继（联系服务提供商获取地址）。"
+            "   UDP 中继端口 = TCP 端口 + 1（如 TCP=25566 则 UDP=25567）"
         )
         tip.setStyleSheet("color: #555; background: #fffde7; padding: 10px; border-radius: 4px;")
         tip.setWordWrap(True)
@@ -352,13 +387,11 @@ class MainWindow(QMainWindow):
     def _create_log_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
-
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Consolas", 9))
         self.log_text.setStyleSheet("background: #1e1e1e; color: #d4d4d4;")
         layout.addWidget(self.log_text)
-
         self.tabs.addTab(tab, "📋 日志")
 
     def _create_about_tab(self):
@@ -367,16 +400,16 @@ class MainWindow(QMainWindow):
         layout.setAlignment(Qt.AlignCenter)
 
         about = QLabel(
-            "Minecraft 异地联机工具 v2.0\n\n"
-            "真正可用的 TCP 中继联机方案\n"
+            "Minecraft 异地联机工具\n\n"
+            "基于 TCP 中继的异地联机方案，支持陶瓦联机房间码格式\n"
             "支持 HMCL / PCL2 / BakaXL / 原版启动器\n\n"
-            "使用方法：\n"
-            "① 房主：确保 Minecraft 服务器已开启\n"
-            "   → 填写中继服务器地址 → 点击「开始联机」→ 分享房间码\n\n"
-            "② 玩家：填写中继地址和房间码\n"
-            "   → 点击「加入游戏」→ 在 MC 中连 127.0.0.1\n\n"
-            "基于 Python 3 + asyncio + PyQt5 开发\n"
-            "GitHub: Wing-KB/minecraft-proxy"
+            "使用步骤：\n"
+            "① 房主：确保 MC 服务器已开启，填写中继地址，点击「开始联机」\n"
+            "   获得房间码后分享给好友\n"
+            "② 玩家：填写中继地址和房间码，点击「加入游戏」\n"
+            "   在 MC 中连接 127.0.0.1:25565 即可进入\n\n"
+            "GitHub: Wing-KB/minecraft-proxy\n"
+            "陶瓦联机: burningtnt/Terracotta"
         )
         about.setAlignment(Qt.AlignCenter)
         about.setFont(QFont("Microsoft YaHei", 10))
@@ -397,41 +430,59 @@ class MainWindow(QMainWindow):
         if not relay:
             QMessageBox.warning(self, "配置错误", "请填写中继服务器地址")
             return
-
         self._mode = "host"
         self.btn_start_host.setEnabled(False)
         self.btn_stop_host.setEnabled(True)
         self.room_code_label.setText("连接中...")
-        self._append_log(f"启动房主模式 → 中继: {relay}:{self.host_relay_port.value()}")
-
+        self._append_log(
+            f"启动房主模式 → 中继: {relay}:{self.host_relay_port.value()} "
+            f"(陶瓦={self.host_terracotta.isChecked()}, "
+            f"UDP={self.host_want_udp.isChecked()})"
+        )
         self._bridge.start_host(
             relay_host=relay,
             relay_port=self.host_relay_port.value(),
             mc_host=self.host_mc_host.text().strip() or "127.0.0.1",
             mc_port=self.host_mc_port.value(),
+            use_terracotta=self.host_terracotta.isChecked(),
+            want_udp=self.host_want_udp.isChecked(),
+            requested_code=self.host_req_code.text().strip(),
         )
 
     def _start_player(self):
         relay = self.join_relay.text().strip()
-        code = self.join_code.text().strip().upper()
+        code = self.join_code.text().strip()
         if not relay:
             QMessageBox.warning(self, "配置错误", "请填写中继服务器地址")
             return
-        if len(code) != 6:
-            QMessageBox.warning(self, "配置错误", "房间码需为 6 位")
+        if not code:
+            QMessageBox.warning(self, "配置错误", "请输入房间码")
+            return
+        # 支持 6 位格式和陶瓦格式（最长 21 位）
+        if len(code) != 6 and not code.startswith("U/"):
+            QMessageBox.warning(
+                self, "格式错误",
+                "房间码格式不正确\n"
+                "支持格式：6 位字母数字（如 AB3C2D）\n"
+                "或陶瓦格式（如 U/8F2K-3M7Q-1X9Z-5N4J）"
+            )
             return
 
         self._mode = "player"
         self.btn_connect.setEnabled(False)
         self.btn_stop_player.setEnabled(True)
         self.join_status_label.setText("正在连接...")
-        self._append_log(f"加入房间 {code} → 中继: {relay}:{self.join_relay_port.value()}")
-
+        self._append_log(
+            f"加入房间 {code} → 中继: {relay}:{self.join_relay_port.value()} "
+            f"(陶瓦={self.join_terracotta.isChecked()})"
+        )
         self._bridge.start_player(
             relay_host=relay,
             relay_port=self.join_relay_port.value(),
             room_code=code,
             local_port=self.join_local_port.value(),
+            use_terracotta=self.join_terracotta.isChecked(),
+            want_udp=self.join_want_udp.isChecked(),
         )
 
     def _stop_session(self):
@@ -442,13 +493,13 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setText(self._room_code)
             self.status_bar.showMessage(f"房间码 {self._room_code} 已复制！", 3000)
 
-    # 内置中继服务器
+    # 内置中继
     def _start_relay(self):
         bind = self.relay_bind.text().strip() or "0.0.0.0"
         port = self.relay_port_spin.value()
         self._bridge._ensure_loop()
         asyncio.run_coroutine_threadsafe(
-            self._run_relay_server(bind, port), self._bridge._loop
+            self._run_relay(bind, port), self._bridge._loop
         )
         self.relay_status_label.setText(f"🟢 中继服务器运行中: {bind}:{port}")
         self.btn_start_relay.setEnabled(False)
@@ -465,12 +516,12 @@ class MainWindow(QMainWindow):
         self.btn_stop_relay.setEnabled(False)
         self._append_log("内置中继服务器已停止")
 
-    async def _run_relay_server(self, bind: str, port: int):
+    async def _run_relay(self, bind, port):
         from ..core.relay_server import RelayServer
         self._relay_server_obj = RelayServer(bind, port)
         await self._relay_server_obj.serve_forever()
 
-    # ── 信号槽回调 ────────────────────────────────────────────
+    # ── 信号槽 ────────────────────────────────────────────
 
     def _on_status(self, msg: str):
         self._append_log(msg)
@@ -488,7 +539,7 @@ class MainWindow(QMainWindow):
     def _on_player_count(self, n: int):
         self._player_count = n
         self.player_count_label.setText(
-            f"{'无玩家连接' if n == 0 else f'当前玩家数: {n}'}"
+            f"无玩家连接" if n == 0 else f"当前玩家数: {n}"
         )
 
     def _on_error(self, msg: str):
@@ -509,14 +560,12 @@ class MainWindow(QMainWindow):
 
     def _reset_ui(self):
         self._mode = "idle"
-        # 房主
         self.btn_start_host.setEnabled(True)
         self.btn_stop_host.setEnabled(False)
         self.room_code_label.setText("——")
         self._room_code = ""
         self.btn_copy_code.setEnabled(False)
         self.player_count_label.setText("等待玩家加入...")
-        # 玩家
         self.btn_connect.setEnabled(True)
         self.btn_stop_player.setEnabled(False)
         self.join_status_label.setText("")
@@ -530,8 +579,6 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(
                 f"房主模式 | 房间: {self._room_code} | 玩家: {self._player_count}"
             )
-        elif self._mode == "player":
-            pass  # 由 _on_status 更新
 
     def closeEvent(self, event):
         self._bridge.stop_all()
@@ -539,6 +586,7 @@ class MainWindow(QMainWindow):
 
 
 # ── Qt 日志处理器 ─────────────────────────────────────────────
+
 class _QtLogHandler(logging.Handler):
     def __init__(self, callback):
         super().__init__()
@@ -558,7 +606,6 @@ def run_ui():
 
     window = MainWindow()
 
-    # 将日志输出到界面
     handler = _QtLogHandler(window._append_log)
     handler.setLevel(logging.INFO)
     logging.getLogger().addHandler(handler)
