@@ -1,63 +1,64 @@
 """
-Minecraft 代理服务器（房主端）
+Minecraft 代理服务器（房主端）—— 包装 HostSession
 """
 import asyncio
 import logging
-import socket
-import time
-import random
-from typing import Dict, Optional
+from typing import Optional, Callable
+from .host_session import HostSession
 
 logger = logging.getLogger(__name__)
 
+
 class ProxyServer:
     """Minecraft 代理服务器（房主端）"""
-    
-    def __init__(self, host="0.0.0.0", mc_port=25565, relay_port=25566,
-                 voice_port=24454, player_name="Host", config=None):
-        self.host = host
-        self.mc_port = mc_port
+
+    def __init__(self, relay_host: str = "127.0.0.1",
+                 relay_port: int = 25566,
+                 mc_host: str = "127.0.0.1",
+                 mc_port: int = 25565,
+                 player_name: str = "Host",
+                 on_status: Optional[Callable[[str], None]] = None,
+                 on_player_count: Optional[Callable[[int], None]] = None,
+                 # 旧参数兼容
+                 host: str = "0.0.0.0",
+                 port: int = 25565,
+                 config=None):
+        # 兼容旧接口
+        if relay_host == "127.0.0.1" and host != "0.0.0.0":
+            relay_host = host
+        self.relay_host = relay_host
         self.relay_port = relay_port
-        self.voice_port = voice_port
+        self.mc_host = mc_host
+        self.mc_port = mc_port
         self.player_name = player_name
-        self.config = config
-        self._running = False
-        self._room_code = ""
-        self._connections: Dict = {}
-        self._start_time = 0
-    
-    async def start(self):
-        """启动代理服务器"""
-        self._running = True
-        self._start_time = time.time()
-        self._room_code = self._generate_room_code()
-        
-        print_banner()
-        logger.info(f"房间码: {self._room_code}")
-        logger.info(f"Minecraft 端口: {self.mc_port}")
-        logger.info(f"中继端口: {self.relay_port}")
-        logger.info(f"语音端口: {self.voice_port}")
-        
-        await self._main_loop()
-    
-    async def _main_loop(self):
-        """主循环"""
-        while self._running:
-            await asyncio.sleep(1)
-            if time.time() - self._start_time > 10:
-                uptime = int(time.time() - self._start_time)
-                logger.info(f"运行中: {uptime}s | 连接: {len(self._connections)}")
-    
-    def _generate_room_code(self) -> str:
-        chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-        return "".join(random.choice(chars) for _ in range(6))
-    
+
+        self._session = HostSession(
+            relay_host=relay_host,
+            relay_port=relay_port,
+            mc_host=mc_host,
+            mc_port=mc_port,
+            on_status=on_status,
+            on_player_count=on_player_count,
+        )
+
+    async def start(self) -> str:
+        """启动，返回房间码"""
+        code = await self._session.start()
+        return code
+
     async def stop(self):
-        """停止服务器"""
-        self._running = False
-    
+        await self._session.stop()
+
+    async def wait_until_stopped(self):
+        await self._session.wait_until_stopped()
+
     @property
     def room_code(self) -> str:
-        return self._room_code
+        return self._session.room_code
+
+    @property
+    def player_count(self) -> int:
+        return self._session.player_count
+
 
 from ..config import print_banner
