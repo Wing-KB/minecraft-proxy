@@ -1,5 +1,8 @@
 """
-PyQt5 主窗口 —— 支持陶瓦联机兼容
+PyQt5 主窗口 —— 自动检测陶瓦联机
+- 无需手动勾选，自动检测本地是否运行陶瓦/EasyTier
+- 检测到陶瓦 → 自动禁用 UDP 中继（避免冲突）
+- 未检测到陶瓦 → 自动启用 UDP 中继
 """
 
 import sys
@@ -11,7 +14,7 @@ from typing import Optional
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QTabWidget, QGroupBox,
-    QFormLayout, QSpinBox, QCheckBox, QStatusBar, QTextEdit,
+    QFormLayout, QSpinBox, QStatusBar, QTextEdit,
     QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
@@ -20,7 +23,7 @@ from PyQt5.QtGui import QFont
 logger = logging.getLogger(__name__)
 
 
-# ── 异步桥 ────────────────────────────────────────────────────
+# ── 异步桥 ─────────────────────────────────────────────
 
 class AsyncBridge(QObject):
     status_signal  = pyqtSignal(str)
@@ -29,6 +32,7 @@ class AsyncBridge(QObject):
     error_signal   = pyqtSignal(str)
     ready_signal   = pyqtSignal()
     stopped_signal = pyqtSignal()
+    terracotta_signal = pyqtSignal(bool, str)
 
     def __init__(self):
         super().__init__()
@@ -45,26 +49,21 @@ class AsyncBridge(QObject):
             )
             self._thread.start()
 
-    def start_host(self, relay_host: str, relay_port: int,
-                     mc_host: str, mc_port: int,
-                     use_terracotta: bool = False,
-                     want_udp: bool = True,
-                     requested_code: str = ""):
+    def start_host(self, relay_host, relay_port,
+                   mc_host, mc_port,
+                   requested_code=""):
         self._ensure_loop()
         asyncio.run_coroutine_threadsafe(
             self._run_host(relay_host, relay_port, mc_host, mc_port,
-                           use_terracotta, want_udp, requested_code),
+                           requested_code),
             self._loop
         )
 
-    def start_player(self, relay_host: str, relay_port: int,
-                      room_code: str, local_port: int,
-                      use_terracotta: bool = False,
-                      want_udp: bool = True):
+    def start_player(self, relay_host, relay_port,
+                    room_code, local_port):
         self._ensure_loop()
         asyncio.run_coroutine_threadsafe(
-            self._run_player(relay_host, relay_port, room_code,
-                             local_port, use_terracotta, want_udp),
+            self._run_player(relay_host, relay_port, room_code, local_port),
             self._loop
         )
 
@@ -73,18 +72,17 @@ class AsyncBridge(QObject):
             asyncio.run_coroutine_threadsafe(self._stop(), self._loop)
 
     async def _run_host(self, relay_host, relay_port, mc_host, mc_port,
-                          use_terracotta, want_udp, requested_code):
+                        requested_code):
         from ..core.host_session import HostSession
         self._server = HostSession(
             relay_host=relay_host,
             relay_port=relay_port,
             mc_host=mc_host,
             mc_port=mc_port,
-            use_terracotta=use_terracotta,
-            enable_udp=want_udp,
             on_status=lambda m: self.status_signal.emit(m),
             on_player_count=lambda n: self.count_signal.emit(n),
             on_room_code=lambda c: self.code_signal.emit(c),
+            on_terracotta_detected=lambda f, s: self.terracotta_signal.emit(f, s),
         )
         try:
             code = await self._server.start(requested_code)
@@ -96,8 +94,7 @@ class AsyncBridge(QObject):
             self.stopped_signal.emit()
             self._server = None
 
-    async def _run_player(self, relay_host, relay_port, room_code,
-                             local_port, use_terracotta, want_udp):
+    async def _run_player(self, relay_host, relay_port, room_code, local_port):
         from ..core.player_session import PlayerSession
         self._client = PlayerSession(
             relay_host=relay_host,
@@ -105,9 +102,8 @@ class AsyncBridge(QObject):
             room_code=room_code,
             local_host="127.0.0.1",
             local_port=local_port,
-            use_terracotta=use_terracotta,
-            enable_udp=want_udp,
             on_status=lambda m: self.status_signal.emit(m),
+            on_terracotta_detected=lambda f, s: self.terracotta_signal.emit(f, s),
         )
         try:
             await self._client.connect()
@@ -127,7 +123,7 @@ class AsyncBridge(QObject):
             await self._client.stop()
 
 
-# ── 主窗口 ────────────────────────────────────────────────────
+# ── 主窗口 ────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
 
@@ -143,6 +139,7 @@ class MainWindow(QMainWindow):
         self._bridge.error_signal.connect(self._on_error)
         self._bridge.ready_signal.connect(self._on_player_ready)
         self._bridge.stopped_signal.connect(self._on_session_stopped)
+        self._bridge.terracotta_signal.connect(self._on_terracotta_detected)
 
         self._mode = "idle"
         self._room_code = ""
@@ -155,7 +152,7 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._update_status_bar)
         self._timer.start(1000)
 
-    # ── UI 构建 ──────────────────────────────────────────────
+    # ── UI 构建 ──────────────────────────────────────────
 
     def _init_ui(self):
         central = QWidget()
@@ -175,7 +172,6 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        # MC 服务器设置
         g1 = QGroupBox("本地 Minecraft 服务器")
         f1 = QFormLayout()
         self.host_mc_host = QLineEdit("127.0.0.1")
@@ -187,7 +183,6 @@ class MainWindow(QMainWindow):
         g1.setLayout(f1)
         layout.addWidget(g1)
 
-        # 中继配置
         g2 = QGroupBox("中继服务器")
         f2 = QFormLayout()
         self.host_relay = QLineEdit()
@@ -200,28 +195,21 @@ class MainWindow(QMainWindow):
         g2.setLayout(f2)
         layout.addWidget(g2)
 
-        # 陶瓦 / UDP 选项
-        g_opt = QGroupBox("联机选项")
-        opt_layout = QHBoxLayout()
-        self.host_terracotta = QCheckBox("使用陶瓦联机")
-        self.host_terracotta.setToolTip("勾选后房间内禁用 UDP 中继（陶瓦基于 P2P VPN）")
-        opt_layout.addWidget(self.host_terracotta)
-        self.host_want_udp = QCheckBox("启用 UDP 中继")
-        self.host_want_udp.setChecked(True)
-        self.host_want_udp.setToolTip("无人用陶瓦时，在中继上开启 UDP 端口映射")
-        opt_layout.addWidget(self.host_want_udp)
-        opt_layout.addStretch()
+        # 陶瓦检测状态（自动，无需勾选）
+        g_opt = QGroupBox("联机状态（自动检测）")
+        opt_layout = QVBoxLayout()
+        self.host_terracotta_label = QLabel("正在检测陶瓦联机状态...")
+        self.host_terracotta_label.setFont(QFont("Microsoft YaHei", 10))
+        opt_layout.addWidget(self.host_terracotta_label)
         g_opt.setLayout(opt_layout)
         layout.addWidget(g_opt)
 
-        # 指定房间码（可选）
         self.host_req_code = QLineEdit()
         self.host_req_code.setPlaceholderText("可选：指定房间码（6位 或 陶瓦格式 U/XXXX-...）")
         self.host_req_code.setMaxLength(21)
         layout.addWidget(QLabel("指定房间码（可选）:"))
         layout.addWidget(self.host_req_code)
 
-        # 房间码显示
         g3 = QGroupBox("房间码（创建后分享给好友）")
         room_layout = QVBoxLayout()
         self.room_code_label = QLabel("——")
@@ -256,7 +244,6 @@ class MainWindow(QMainWindow):
         g3.setLayout(room_layout)
         layout.addWidget(g3)
 
-        # 玩家列表
         g4 = QGroupBox("已连接玩家")
         player_layout = QVBoxLayout()
         self.player_count_label = QLabel("等待玩家加入...")
@@ -299,15 +286,12 @@ class MainWindow(QMainWindow):
         g1.setLayout(f1)
         layout.addWidget(g1)
 
-        # 选项
-        g_opt = QGroupBox("联机选项")
-        opt_layout = QHBoxLayout()
-        self.join_terracotta = QCheckBox("使用陶瓦联机")
-        opt_layout.addWidget(self.join_terracotta)
-        self.join_want_udp = QCheckBox("启用 UDP 中继")
-        self.join_want_udp.setChecked(True)
-        opt_layout.addWidget(self.join_want_udp)
-        opt_layout.addStretch()
+        # 陶瓦检测状态（自动，无需勾选）
+        g_opt = QGroupBox("联机状态（自动检测）")
+        opt_layout = QVBoxLayout()
+        self.join_terracotta_label = QLabel("正在检测陶瓦联机状态...")
+        self.join_terracotta_label.setFont(QFont("Microsoft YaHei", 10))
+        opt_layout.addWidget(self.join_terracotta_label)
         g_opt.setLayout(opt_layout)
         layout.addWidget(g_opt)
 
@@ -375,7 +359,8 @@ class MainWindow(QMainWindow):
 
         tip = QLabel(
             "💡 如果你有公网 IP，可以在这里启动中继服务器让好友连接。\n"
-            "   UDP 中继端口 = TCP 端口 + 1（如 TCP=25566 则 UDP=25567）"
+            "   UDP 中继端口 = TCP 端口 + 1（如 TCP=25566 则 UDP=25567）\n"
+            "   房间内有陶瓦用户时，UDP 中继自动禁用"
         )
         tip.setStyleSheet("color: #555; background: #fffde7; padding: 10px; border-radius: 4px;")
         tip.setWordWrap(True)
@@ -402,7 +387,7 @@ class MainWindow(QMainWindow):
         about = QLabel(
             "Minecraft 异地联机工具\n\n"
             "基于 TCP 中继的异地联机方案，支持陶瓦联机房间码格式\n"
-            "支持 HMCL / PCL2 / BakaXL / 原版启动器\n\n"
+            "自动检测本地陶瓦联机状态，无需手动设置\n\n"
             "使用步骤：\n"
             "① 房主：确保 MC 服务器已开启，填写中继地址，点击「开始联机」\n"
             "   获得房间码后分享给好友\n"
@@ -423,7 +408,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("就绪")
 
-    # ── 事件处理 ──────────────────────────────────────────────
+    # ── 事件处理 ──────────────────────────────────────────
 
     def _start_host(self):
         relay = self.host_relay.text().strip()
@@ -435,17 +420,13 @@ class MainWindow(QMainWindow):
         self.btn_stop_host.setEnabled(True)
         self.room_code_label.setText("连接中...")
         self._append_log(
-            f"启动房主模式 → 中继: {relay}:{self.host_relay_port.value()} "
-            f"(陶瓦={self.host_terracotta.isChecked()}, "
-            f"UDP={self.host_want_udp.isChecked()})"
+            f"启动房主模式 → 中继: {relay}:{self.host_relay_port.value()}"
         )
         self._bridge.start_host(
             relay_host=relay,
             relay_port=self.host_relay_port.value(),
             mc_host=self.host_mc_host.text().strip() or "127.0.0.1",
             mc_port=self.host_mc_port.value(),
-            use_terracotta=self.host_terracotta.isChecked(),
-            want_udp=self.host_want_udp.isChecked(),
             requested_code=self.host_req_code.text().strip(),
         )
 
@@ -458,7 +439,6 @@ class MainWindow(QMainWindow):
         if not code:
             QMessageBox.warning(self, "配置错误", "请输入房间码")
             return
-        # 支持 6 位格式和陶瓦格式（最长 21 位）
         if len(code) != 6 and not code.startswith("U/"):
             QMessageBox.warning(
                 self, "格式错误",
@@ -472,17 +452,12 @@ class MainWindow(QMainWindow):
         self.btn_connect.setEnabled(False)
         self.btn_stop_player.setEnabled(True)
         self.join_status_label.setText("正在连接...")
-        self._append_log(
-            f"加入房间 {code} → 中继: {relay}:{self.join_relay_port.value()} "
-            f"(陶瓦={self.join_terracotta.isChecked()})"
-        )
+        self._append_log(f"加入房间 {code} → 中继: {relay}:{self.join_relay_port.value()}")
         self._bridge.start_player(
             relay_host=relay,
             relay_port=self.join_relay_port.value(),
             room_code=code,
             local_port=self.join_local_port.value(),
-            use_terracotta=self.join_terracotta.isChecked(),
-            want_udp=self.join_want_udp.isChecked(),
         )
 
     def _stop_session(self):
@@ -521,7 +496,7 @@ class MainWindow(QMainWindow):
         self._relay_server_obj = RelayServer(bind, port)
         await self._relay_server_obj.serve_forever()
 
-    # ── 信号槽 ────────────────────────────────────────────
+    # ── 信号槽 ────────────────────────────────────────
 
     def _on_status(self, msg: str):
         self._append_log(msg)
@@ -558,6 +533,18 @@ class MainWindow(QMainWindow):
         self._append_log("会话已结束")
         self._reset_ui()
 
+    def _on_terracotta_detected(self, detected, status):
+        """陶瓦检测结果的 UI 回调（房主端和玩家端共用）"""
+        color = "#4CAF50" if detected else "#757575"
+        icon = "✅" if detected else "❌"
+        text = f"{icon} {status}"
+        if self._mode == "host" or self.tabs.currentIndex() == 0:
+            self.host_terracotta_label.setText(text)
+            self.host_terracotta_label.setStyleSheet(f"color: {color}; padding: 4px;")
+        if self._mode == "player" or self.tabs.currentIndex() == 1:
+            self.join_terracotta_label.setText(text)
+            self.join_terracotta_label.setStyleSheet(f"color: {color}; padding: 4px;")
+
     def _reset_ui(self):
         self._mode = "idle"
         self.btn_start_host.setEnabled(True)
@@ -585,7 +572,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-# ── Qt 日志处理器 ─────────────────────────────────────────────
+# ── Qt 日志处理器 ─────────────────────────────────────────
 
 class _QtLogHandler(logging.Handler):
     def __init__(self, callback):

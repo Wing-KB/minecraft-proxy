@@ -1,14 +1,20 @@
 """
-玩家端核心逻辑（陶瓦兼容版）
+玩家端核心逻辑（自动检测陶瓦版）
+- 自动检测本地是否使用陶瓦，无需手动勾选
+- 检测到陶瓦 → 禁用 UDP 中继（避免冲突）
+- 未检测到陶瓦 → 自动请求 UDP 中继
+
 协议:
   加入: [cmd=0x02] [data_len] [flags(1)] [房间码ASCII]
   回应: [cmd=0x10] [len] [player_id(1)] [udp_port(2)]
+  flags: bit0=陶瓦, bit1=请求UDP
 """
 
 import asyncio
 import logging
 import struct
 from typing import Optional, Callable
+from .terracotta_compat import detect_terracotta, get_terracotta_status
 from .relay_server import (
     CMD_OK, CMD_ERROR, CMD_DATA, CMD_PING, CMD_PONG,
     CMD_PLAYER_JOINED, CMD_PLAYER_LEFT, CMD_UDP,
@@ -20,20 +26,30 @@ logger = logging.getLogger(__name__)
 RELAY_DEF_PORT = 25566
 KA_INTERVAL = 30
 
+# 协议命令（避免循环引用）
+CMD_REGISTER = 0x01
+CMD_JOIN = 0x02
+
 
 class PlayerSession:
+    """
+    玩家端会话。
+    自动检测陶瓦状态，无需手动设置。
+    """
     def __init__(self, relay_host="127.0.0.1", relay_port=RELAY_DEF_PORT,
                  room_code="", local_host="127.0.0.1", local_port=25565,
-                 use_terracotta=False, want_udp=True,
-                 on_status=None):
+                 on_status=None, on_terracotta_detected=None):
         self.relay_host = relay_host
         self.relay_port = relay_port
         self.room_code = room_code.upper().strip()
         self.local_host = local_host
         self.local_port = local_port
-        self.use_terracotta = use_terracotta
-        self.want_udp = want_udp
         self.on_status = on_status
+        self.on_terracotta_detected = on_terracotta_detected
+
+        # 自动检测
+        self.use_terracotta = detect_terracotta()
+        self.want_udp = not self.use_terracotta
 
         self._running = False
         self._pid = 0
@@ -50,7 +66,20 @@ class PlayerSession:
         if self.on_status:
             self.on_status(msg)
 
+    @property
+    def terracotta_status(self) -> str:
+        return get_terracotta_status()
+
     async def connect(self) -> int:
+        # 每次连接都重新检测
+        self.use_terracotta = detect_terracotta()
+        self.want_udp = not self.use_terracotta
+
+        tc_status = get_terracotta_status()
+        self._log(f"陶瓦检测: {tc_status}")
+        if self.on_terracotta_detected:
+            self.on_terracotta_detected(self.use_terracotta, tc_status)
+
         self._log(f"连接中继 {self.relay_host}:{self.relay_port} ...")
         self._rdr, self._wtr = await asyncio.wait_for(
             asyncio.open_connection(self.relay_host, self.relay_port), timeout=10)
@@ -76,7 +105,7 @@ class PlayerSession:
         self._running = True
 
         info = "陶瓦模式 | " if self.use_terracotta else ""
-        udp_info = f"UDP中继: 启用(端口{self._udp_port})" if self._udp_port else "UDP: 禁用"
+        udp_info = f"UDP中继: 启用(端口{self._udp_port})" if self._udp_port else "UDP: 禁用（房间内有陶瓦用户）"
         self._log(f"已加入 {self.room_code} (ID={self._pid}) | {info}{udp_info}")
         return self._pid
 
@@ -168,7 +197,7 @@ class PlayerSession:
             self._stop_ev.set()
 
     async def _udp_listen(self):
-        """监听本地 UDP，转发给中继（简化版）"""
+        """监听本地 UDP，转发给中继"""
         loop = asyncio.get_running_loop()
         try:
             transport, _ = await loop.create_datagram_endpoint(
@@ -177,7 +206,8 @@ class PlayerSession:
             self._log(f"UDP中继监听: {self.local_host}:{self.local_port+1}")
             await asyncio.sleep(999999)
         except asyncio.CancelledError:
-            transport.close()
+            if 'transport' in locals():
+                transport.close()
         except Exception as e:
             self._log(f"UDP中继启动失败: {e}")
 
@@ -197,7 +227,6 @@ class _UdpClient(asyncio.DatagramProtocol):
 
     async def _send(self, data: bytes):
         try:
-            # CMD_UDP + pid(2) + data
             pkt = struct.pack(">BH", CMD_UDP, 2+len(data)) + struct.pack(">H", self.session._pid) + data
             self.session._wtr.write(pkt)
             await self.session._wtr.drain()

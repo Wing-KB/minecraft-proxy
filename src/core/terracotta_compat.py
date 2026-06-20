@@ -1,6 +1,6 @@
 """
 陶瓦联机 (Terracotta) 房间码兼容模块
-陶瓦房间码格式: U/XXXX-XXXX-XXXX-XXXX  (共21字符)
+陶瓦房间码格式: U/XXXX-XXXX-XXXX-XXXX (共21字符)
 - 前缀: U/
 - 16位 Base34 编码字符集: 0123456789ABCDEFGHJKLMNPQRSTUVWXYZ (排除 I 和 O)
 - 分隔符: 每4位一个 '-'
@@ -14,7 +14,10 @@
 
 import re
 import secrets
+import sys
+import subprocess
 from typing import Optional, Tuple
+
 
 # 陶瓦使用的 Base34 字符集 (34 = 2*17, 排除易混淆的 I 和 O)
 TERRACOTTA_CHARSET = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -38,12 +41,6 @@ def parse_terracotta_code(code: str) -> Optional[Tuple[int, str, str]]:
     """
     解析陶瓦房间码，返回 (seed, network_name, network_secret)
     如果格式无效或校验失败，返回 None
-
-    陶瓦房间码编码规则（从 Rust 代码逆向）:
-    - 生成随机 u128，取模 34^16，再对齐到 7 的倍数
-    - 从低位到高位依次取 Base34 的一位，逆序拼成 16 位字符串
-    - 前8位 -> network_name (格式: scaffolding-mc-XXXX-XXXX)
-    - 后8位 -> network_secret (格式: XXXX-XXXX)
     """
     code = code.strip()
     if not code:
@@ -64,7 +61,6 @@ def parse_terracotta_code(code: str) -> Optional[Tuple[int, str, str]]:
         return None
 
     # 陶瓦的编码是从低位到高位，解析时需逆序处理
-    # body[0] 对应最低位，body[15] 对应最高位
     try:
         value = 0
         for ch in body:  # 从最低位到最高位
@@ -80,23 +76,14 @@ def parse_terracotta_code(code: str) -> Optional[Tuple[int, str, str]]:
         return None
 
     # 反向推导 network_name 和 network_secret
-    # 编码时: for i in 0..16: v = (value % 34); value /= 34
-    #   code_char[i] = CHARS[v]
-    #   if i < 8: network_name_char[i] = code_char[i]
-    #   else:     network_secret_char[i-8] = code_char[i]
-    # 注意: code 中字符顺序是逆序的 (低位在前)
-
-    # 从 value 重新提取各位（低位在前 = body 的顺序）
     temp_value = value
     chars = []
     for _ in range(16):
         chars.append(TERRACOTTA_CHARSET[temp_value % 34])
         temp_value //= 34
 
-    # chars[0..7] = 前8位 -> network_name
     nc = chars[0:4] + ["-"] + chars[4:8]
     network_name = "scaffolding-mc-" + "".join(nc)
-    # chars[8..15] = 后8位 -> network_secret
     sc = chars[8:12] + ["-"] + chars[12:16]
     network_secret = "".join(sc)
 
@@ -109,35 +96,19 @@ def is_terracotta_code(code: str) -> bool:
 
 
 def generate_terracotta_compatible_code() -> str:
-    """
-    生成一个陶瓦兼容的房间码 (U/XXXX-XXXX-XXXX-XXXX 格式)
-    可用于让熟悉陶瓦的用户更容易接受
-    """
+    """生成一个陶瓦兼容的房间码 (U/XXXX-XXXX-XXXX-XXXX 格式)"""
     while True:
         raw = secrets.token_bytes(16)
         value = int.from_bytes(raw, "big") % (34 ** 16)
-        value = value - (value % 7)  # 对齐到 7 的倍数
+        value = value - (value % 7)
         if value == 0:
             continue
 
-        # 从低位到高位编码为 Base34 字符
         chars = []
         v = value
         for _ in range(16):
             chars.append(TERRACOTTA_CHARSET[v % 34])
             v //= 34
-
-        # chars 现在是低位在前，按陶瓦格式加分隔符
-        # 陶瓦格式: U/XXXX-XXXX-XXXX-XXXX
-        # 注意: 陶瓦代码中是从 i=0..15 依次 push，并在 i==4,8,12 时加 '-'
-        # 即: chars[0..3] + '-' + chars[4..7] + '-' + chars[8..11] + '-' + chars[12..15]
-        # 但 chars 是低位在前，陶瓦显示时是逆序的吗？
-        # 看陶瓦代码: for i in 0..16: v = CHARS[(value % 34) as usize]; value /= 34;
-        #   if i == 4 || i == 8 || i == 12 { code.push('-'); }
-        #   code.push(v);
-        # 所以 code 字符串中，最低位在 index 0，最高位在 index 15+3=18 (加3个分隔符)
-        # 即: code = [位0][位1][位2][位3]-[位4][位5][位6][位7]-[位8][位9][位10][位11]-[位12][位13][位14][位15]
-        # 显示时从左到右是低位到高位
 
         code_body = (
             chars[0] + chars[1] + chars[2] + chars[3] + "-"
@@ -159,3 +130,147 @@ def generate_room_code(terracotta_format: bool = False) -> str:
     else:
         chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         return "".join(secrets.choice(chars) for _ in range(6))
+
+
+# ── 自动检测陶瓦联机（EasyTier）───────────────────────────────────────────────────
+
+def detect_terracotta() -> bool:
+    """
+    自动检测本地是否正在使用陶瓦联机（EasyTier）。
+    检测方法（按优先级）:
+      1. 检测 EasyTier 相关进程是否在运行
+      2. 检测陶瓦配置文件是否存在
+      3. 检测典型端口（11010/11011）是否被监听
+
+    返回: True = 检测到陶瓦/EasyTier，False = 未检测到
+    """
+    if _detect_process():
+        return True
+    if _detect_config():
+        return True
+    if _detect_port():
+        return True
+    return False
+
+
+def _detect_process() -> bool:
+    """检测 EasyTier / 陶瓦 相关进程"""
+    try:
+        if sys.platform.startswith("win"):
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq easytier*", "/NH"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "easytier" in result.stdout.lower():
+                return True
+            result2 = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq terracotta*", "/NH"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "terracotta" in result2.stdout.lower():
+                return True
+        else:
+            result = subprocess.run(
+                ["ps", "aux"],
+                capture_output=True, text=True, timeout=5
+            )
+            for keyword in ["easytier", "terracotta", "easytier-core"]:
+                if keyword in result.stdout.lower():
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _detect_config() -> bool:
+    """检测陶瓦 / EasyTier 配置文件是否存在"""
+    try:
+        if sys.platform.startswith("win"):
+            import os
+            user_home = os.path.expanduser("~")
+            config_paths = [
+                os.path.join(user_home, ".terracotta"),
+                os.path.join(user_home, ".easytier"),
+                os.path.join(user_home, "AppData", "Roaming", "Terracotta"),
+            ]
+        else:
+            import os
+            user_home = os.path.expanduser("~")
+            config_paths = [
+                os.path.join(user_home, ".terracotta"),
+                os.path.join(user_home, ".easytier"),
+                "/etc/easytier",
+            ]
+        for p in config_paths:
+            if os.path.exists(p):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _detect_port() -> bool:
+    """检测 EasyTier 典型端口（11010/11011）是否被监听"""
+    try:
+        if sys.platform.startswith("win"):
+            result = subprocess.run(
+                ["netstat", "-an"],
+                capture_output=True, text=True, timeout=5
+            )
+            for port in ["11010", "11011", "22000"]:
+                if ":" + port in result.stdout:
+                    return True
+        else:
+            result = subprocess.run(
+                ["ss", "-tuln"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0:
+                result = subprocess.run(
+                    ["netstat", "-tuln"],
+                    capture_output=True, text=True, timeout=5
+                )
+            for port in ["11010", "11011", "22000"]:
+                if ":" + port in result.stdout:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def get_terracotta_status() -> str:
+    """
+    获取陶瓦检测状态的详细文字说明，用于 UI 显示。
+    返回: 如 "已检测到大瓦 (EasyTier 进程中)" 或 "未检测到陶瓦"
+    """
+    try:
+        if sys.platform.startswith("win"):
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq easytier*", "/NH"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "easytier" in result.stdout.lower():
+                return "已检测到大瓦联机 (EasyTier 进程中)"
+            result2 = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq terracotta*", "/NH"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "terracotta" in result2.stdout.lower():
+                return "已检测到陶瓦联机 (Terracotta 进程中)"
+        else:
+            result = subprocess.run(
+                ["ps", "aux"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "easytier" in result.stdout.lower():
+                return "已检测到大瓦联机 (EasyTier 进程中)"
+            if "terracotta" in result.stdout.lower():
+                return "已检测到陶瓦联机 (Terracotta 进程中)"
+    except Exception:
+        pass
+
+    if _detect_config():
+        return "检测到陶瓦配置文件（未运行中）"
+    if _detect_port():
+        return "检测到陶瓦/EasyTier 端口（可能运行中）"
+    return "未检测到陶瓦联机"

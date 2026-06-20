@@ -8,7 +8,7 @@ Minecraft 异地联机工具
   python launcher.py --relay-server           # 独立运行中继服务器
   python launcher.py --mode host              # 命令行房主
   python launcher.py --mode client            # 命令行玩家
-  python launcher.py --terracotta            # 标记使用陶瓦联机
+（陶瓦联机自动检测，无需手动指定）
 """
 
 import sys
@@ -44,10 +44,6 @@ def main():
                         help="房间码（玩家模式必填，支持 6 位或陶瓦格式）")
     parser.add_argument("--bind", default="0.0.0.0",
                         help="中继服务器绑定地址（默认 0.0.0.0）")
-    parser.add_argument("--terracotta", action="store_true",
-                        help="标记本端使用陶瓦联机（房间内有人用时禁用 UDP）")
-    parser.add_argument("--no-udp", action="store_true",
-                        help="禁用 UDP 中继")
     parser.add_argument("--request-code", default="",
                         help="指定房间码（房主模式，可选）")
     args = parser.parse_args()
@@ -66,8 +62,6 @@ def main():
             relay=args.relay,
             relay_port=args.relay_port,
             mc_port=args.mc_port,
-            use_terracotta=args.terracotta,
-            enable_udp=not args.no_udp,
             requested_code=args.request_code,
         )
         return
@@ -85,8 +79,6 @@ def main():
             relay_port=args.relay_port,
             code=args.code,
             local_port=args.local_port,
-            use_terracotta=args.terracotta,
-            enable_udp=not args.no_udp,
         )
         return
 
@@ -117,27 +109,19 @@ def _run_relay(bind: str, port: int):
 
 
 def _run_host(relay: str, relay_port: int, mc_port: int,
-               use_terracotta: bool = False,
-               enable_udp: bool = True,
                requested_code: str = ""):
     from src.core.host_session import HostSession
-    print(f"房主模式: 中继={relay}:{relay_port}, MC={mc_port}, "
-          f"陶瓦={use_terracotta}, UDP={enable_udp}")
-
     async def _main():
         session = HostSession(
             relay_host=relay,
             relay_port=relay_port,
             mc_host="127.0.0.1",
             mc_port=mc_port,
-            use_terracotta=use_terracotta,
-            enable_udp=enable_udp,
         )
         code = await session.start(requested_code)
         print(f"\n{'='*40}")
         print(f"  房间码: {code}")
-        if use_terracotta:
-            print(f"  ⚠️  已标记使用陶瓦联机，UDP 中继已禁用")
+        print(f"  陶瓦检测: {session.terracotta_status}")
         print(f"  分享这个码给好友即可加入！")
         print(f"{'='*40}\n")
         await session.wait_until_stopped()
@@ -149,13 +133,8 @@ def _run_host(relay: str, relay_port: int, mc_port: int,
 
 
 def _run_player(relay: str, relay_port: int, code: str,
-                local_port: int,
-                use_terracotta: bool = False,
-                enable_udp: bool = True):
+                local_port: int):
     from src.core.player_session import PlayerSession
-    print(f"玩家模式: 中继={relay}:{relay_port}, 房间={code}, "
-          f"陶瓦={use_terracotta}, UDP={enable_udp}")
-
     async def _main():
         session = PlayerSession(
             relay_host=relay,
@@ -163,14 +142,14 @@ def _run_player(relay: str, relay_port: int, code: str,
             room_code=code,
             local_host="127.0.0.1",
             local_port=local_port,
-            use_terracotta=use_terracotta,
-            enable_udp=enable_udp,
         )
-        await session.connect()
-        await session.start_local()
+        pid = await session.connect()
         print(f"\n{'='*40}")
-        print(f"  已就绪！在 Minecraft 中连接 127.0.0.1:{local_port}")
+        print(f"  已加入房间 (ID={pid})")
+        print(f"  陶瓦检测: {session.terracotta_status}")
+        print(f"  在 Minecraft 中连接 127.0.0.1:{local_port}")
         print(f"{'='*40}\n")
+        await session.start_local()
         await session.wait_until_stopped()
 
     try:

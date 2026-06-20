@@ -1,15 +1,20 @@
 """
-房主端核心逻辑（陶瓦兼容版）
+房主端核心逻辑（自动检测陶瓦版）
+- 自动检测本地是否使用陶瓦，无需手动勾选
+- 检测到陶瓦 → 禁用 UDP 中继（避免冲突）
+- 未检测到陶瓦 → 自动请求 UDP 中继
+
 协议:
   注册: [cmd=0x01] [data_len] [flags(1)] [可选: 房间码ASCII]
-  回应: [cmd=0x10] [len] [房间码ASCII] [udp_port(2字节)]
-  房主 flags: bit0=陶瓦, bit1=请求UDP
+  回应: [cmd=0x10] [len] [code_len(1)] [房间码ASCII] [udp_port(2)]
+  flags: bit0=陶瓦, bit1=请求UDP
 """
 
 import asyncio
 import logging
 import struct
 from typing import Dict, Optional, Callable
+from .terracotta_compat import detect_terracotta, get_terracotta_status
 from .relay_server import (
     CMD_OK, CMD_ERROR, CMD_DATA, CMD_PING, CMD_PONG,
     CMD_PLAYER_JOINED, CMD_PLAYER_LEFT, CMD_UDP,
@@ -23,24 +28,31 @@ KA_INTERVAL = 30
 
 
 class HostSession:
+    """
+    房主端会话。
+    自动检测陶瓦状态，无需手动设置。
+    """
     def __init__(self, relay_host="127.0.0.1", relay_port=RELAY_DEF_PORT,
                  mc_host="127.0.0.1", mc_port=25565,
-                 use_terracotta=False, want_udp=True,
-                 on_status=None, on_player_count=None, on_room_code=None):
+                 on_status=None, on_player_count=None, on_room_code=None,
+                 on_terracotta_detected=None):
         self.relay_host = relay_host
         self.relay_port = relay_port
         self.mc_host = mc_host
         self.mc_port = mc_port
-        self.use_terracotta = use_terracotta
-        self.want_udp = want_udp
         self.on_status = on_status
         self.on_player_count = on_player_count
         self.on_room_code = on_room_code
+        self.on_terracotta_detected = on_terracotta_detected
+
+        # 自动检测，不依赖外部传参
+        self.use_terracotta = detect_terracotta()
+        self.want_udp = not self.use_terracotta
 
         self._code = ""
         self._running = False
-        self._rdr = None   # StreamReader
-        self._wtr = None   # StreamWriter
+        self._rdr = None
+        self._wtr = None
         self._mc_writers: Dict[int, asyncio.StreamWriter] = {}
         self._pcount = 0
         self._stop_ev = asyncio.Event()
@@ -59,7 +71,20 @@ class HostSession:
     def player_count(self):
         return self._pcount
 
+    @property
+    def terracotta_status(self) -> str:
+        return get_terracotta_status()
+
     async def start(self, requested_code="") -> str:
+        # 每次启动都重新检测
+        self.use_terracotta = detect_terracotta()
+        self.want_udp = not self.use_terracotta
+
+        tc_status = get_terracotta_status()
+        self._log(f"陶瓦检测: {tc_status}")
+        if self.on_terracotta_detected:
+            self.on_terracotta_detected(self.use_terracotta, tc_status)
+
         self._log(f"连接中继 {self.relay_host}:{self.relay_port} ...")
         self._rdr, self._wtr = await asyncio.wait_for(
             asyncio.open_connection(self.relay_host, self.relay_port), timeout=10)
@@ -70,7 +95,6 @@ class HostSession:
         if self.want_udp and not self.use_terracotta:
             flags |= FLAG_WANT_UDP
 
-        # 构建注册包
         body = bytes([flags])
         if requested_code:
             body += requested_code.upper().encode("ascii")
@@ -81,25 +105,20 @@ class HostSession:
         if cmd != CMD_OK:
             raise RuntimeError(f"注册失败: {data.decode(errors='replace')}")
 
-        # 解析回应: 房间码(变长) + UDP端口(2字节)
-        # 找房间码和UDP端口的分界
-        udp_port = 0
-        code_bytes = data
-        if len(data) >= 2:
-            # 最后2字节可能是 UDP 端口
-            maybe_port = struct.unpack(">H", data[-2:])[0]
-            # 如果房间码是6位或21位陶瓦格式，则最后2字节是UDP端口
-            code_part = data[:-2]
-            if (len(code_part) == 6 and code_part.isalnum()) or \
-               (len(code_part) == 21 and data[:2] == b"U/"):
-                code_bytes = code_part
-                udp_port = maybe_port
-
+        # 解析回应: [code_len(1)] [code ascii] [udp_port(2)]
+        if len(data) < 3:
+            raise RuntimeError("服务器回应格式错误")
+        code_len = data[0]
+        if len(data) < 1 + code_len + 2:
+            raise RuntimeError("服务器回应格式错误（长度不足）")
+        code_bytes = data[1:1+code_len]
         self._code = code_bytes.decode("ascii").strip()
+        udp_port = struct.unpack(">H", data[1+code_len:1+code_len+2])[0]
+
         self._running = True
 
         info = "陶瓦模式 | " if self.use_terracotta else ""
-        udp_info = f"UDP中继端口: {udp_port}" if udp_port else "UDP: 禁用"
+        udp_info = f"UDP中继端口: {udp_port}" if udp_port else "UDP: 禁用（房间内有陶瓦用户）"
         self._log(f"房间已创建: {self._code} | {info}{udp_info}")
         if self.on_room_code:
             self.on_room_code(self._code)
@@ -116,12 +135,16 @@ class HostSession:
         for t in self._tasks:
             t.cancel()
         for w in list(self._mc_writers.values()):
-            try: w.close()
-            except: pass
+            try:
+                w.close()
+            except Exception:
+                pass
         self._mc_writers.clear()
         if self._wtr:
-            try: self._wtr.close()
-            except: pass
+            try:
+                self._wtr.close()
+            except Exception:
+                pass
         self._log("房主端已停止")
 
     async def wait_until_stopped(self):
@@ -132,9 +155,12 @@ class HostSession:
     async def _ka_loop(self):
         while self._running:
             await asyncio.sleep(KA_INTERVAL)
-            if not self._running: break
-            try: await _send_pkt(self._wtr, CMD_PING)
-            except: break
+            if not self._running:
+                break
+            try:
+                await _send_pkt(self._wtr, CMD_PING)
+            except Exception:
+                break
 
     async def _relay_loop(self):
         try:
@@ -143,9 +169,11 @@ class HostSession:
                     cmd, data = await asyncio.wait_for(
                         _read_pkt(self._rdr), timeout=120)
                 except asyncio.TimeoutError:
-                    self._log("中继超时断开"); break
+                    self._log("中继超时断开")
+                    break
 
-                if cmd == CMD_PONG: pass
+                if cmd == CMD_PONG:
+                    pass
                 elif cmd == CMD_PLAYER_JOINED:
                     pid = data[0] if data else 0
                     flags = data[1] if len(data) >= 2 else 0
@@ -155,15 +183,13 @@ class HostSession:
                     pid = data[0] if data else 0
                     self._on_player_left(pid)
                 elif cmd == CMD_DATA:
-                    # data[0:2]=pid(网络字节序)  data[2:]=payload
                     if len(data) >= 2:
                         pid = struct.unpack(">H", data[:2])[0]
                         await self._fwd_to_mc(pid, data[2:])
                 elif cmd == CMD_UDP:
-                    # 房主发来的 UDP 数据（通过TCP隧道）
                     if len(data) >= 2:
                         pid = struct.unpack(">H", data[:2])[0]
-                        # TODO: 转发 UDP 给本地 MC
+                        logger.debug(f"[HOST] UDP数据来自玩家{pid}（长度{len(data)-2}）")
                 else:
                     logger.debug(f"[HOST] 未知 cmd=0x{cmd:02X}")
         except Exception as e:
@@ -178,11 +204,13 @@ class HostSession:
             r, w = await asyncio.wait_for(
                 asyncio.open_connection(self.mc_host, self.mc_port), timeout=10)
         except Exception as e:
-            self._log(f"连接本地MC失败(p{pid}): {e}"); return
+            self._log(f"连接本地MC失败(p{pid}): {e}")
+            return
 
         self._mc_writers[pid] = w
         self._pcount += 1
-        if self.on_player_count: self.on_player_count(self._pcount)
+        if self.on_player_count:
+            self.on_player_count(self._pcount)
         self._log(f"玩家 {pid} 已连接MC，开始中继")
         asyncio.create_task(self._mc_to_relay(pid, r))
 
@@ -190,26 +218,38 @@ class HostSession:
         self._log(f"玩家 {pid} 离开")
         w = self._mc_writers.pop(pid, None)
         if w:
-            try: w.close()
-            except: pass
+            try:
+                w.close()
+            except Exception:
+                pass
         self._pcount = max(0, self._pcount - 1)
-        if self.on_player_count: self.on_player_count(self._pcount)
+        if self.on_player_count:
+            self.on_player_count(self._pcount)
 
     async def _fwd_to_mc(self, pid: int, data: bytes):
         w = self._mc_writers.get(pid)
         if w:
             try:
-                w.write(data); await w.drain()
-            except:
+                w.write(data)
+                await w.drain()
+            except Exception:
                 self._on_player_left(pid)
 
     async def _mc_to_relay(self, pid: int, r: asyncio.StreamReader):
         try:
             while self._running and pid in self._mc_writers:
                 d = await asyncio.wait_for(r.read(65536), timeout=60)
-                if not d: break
+                if not d:
+                    break
                 pkt = struct.pack(">BH", CMD_DATA, 2+len(d)) + struct.pack(">H", pid) + d
-                self._wtr.write(pkt); await self._wtr.drain()
-        except: pass
+                self._wtr.write(pkt)
+                await self._wtr.drain()
+        except Exception:
+            pass
         finally:
             self._on_player_left(pid)
+
+
+# 协议常量（与 relay_server 保持一致，避免循环引用）
+CMD_REGISTER = 0x01
+CMD_JOIN = 0x02
