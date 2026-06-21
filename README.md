@@ -45,7 +45,7 @@
 
 ### 方式一：下载发布包（推荐）
 
-前往 [Releases](https://github.com/Wing-KB/minecraft-proxy/releases) 页面下载对应平台的可执行文件，解压即用。
+前往 [Releases](https://github.com/Wing-KB/minecraft-proxy/releases) 页面下载对应平台的可执行文件，解压即用。(注：有时候会自动编译失败会导致没有可执行文件)
 
 ### 方式二：从源码运行
 
